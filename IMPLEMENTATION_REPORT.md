@@ -134,20 +134,42 @@ match rng.gen_range(0..4) {
 
 ### Test Configuration
 ```bash
+# Basic functionality test
 cargo run --release -- --peers 4 --bad-peers 1 --duration-secs 8
+
+# Honest-only baseline test
+cargo run --release -- --peers 3 --bad-peers 0 --duration-secs 5
+
+# Larger scale test
+cargo run --release -- --peers 6 --bad-peers 2 --duration-secs 12
+
+# Custom parameters test
+cargo run --release -- --peers 5 --bad-peers 2 --duration-secs 10 --publish-per-sec 3 --spam-per-sec 8
 ```
 
 ### Actual Results
 ```
+# Test with mixed peers (4 total, 1 bad)
 === SIMULATION SUMMARY ===
 Total Peers: 4 (Honest: 3, Bad: 1)
-Total Messages: 384
-  - Accepted: 54 (14.1%)
-  - Rejected: 75 (19.5%) 
-  - Ignored: 255 (66.4%)
-Honest Message Success Rate: 75%+ (for honest peers)
-Quarantined Peers: 1 (the malicious peer)
-Outcome: SUCCESS - System working as designed
+Total Messages: 1560
+  - Accepted: 126 (8.1%)
+  - Rejected: 351 (22.5%)
+  - Ignored: 1083 (69.4%)
+Honest Message Success Rate: 1.7%
+Quarantined Peers: 3
+========================
+
+# Test with only honest peers (baseline)
+=== SIMULATION SUMMARY ===
+Total Peers: 3 (Honest: 3, Bad: 0)
+Total Messages: 150
+  - Accepted: 64 (42.7%)
+  - Rejected: 14 (9.3%)
+  - Ignored: 72 (48.0%)
+Honest Message Success Rate: 82.1%
+Quarantined Peers: 2
+========================
 ```
 
 ### Performance Analysis

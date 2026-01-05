@@ -67,11 +67,17 @@ src/
 
 ### Basic Simulation
 ```bash
-# Run with 4 peers (3 honest, 1 malicious) for 10 seconds
-cargo run --release -- --peers 4 --bad-peers 1 --duration-secs 10
+# Run with 4 peers (3 honest, 1 malicious) for 8 seconds
+cargo run --release -- --peers 4 --bad-peers 1 --duration-secs 8
+
+# Test with only honest peers (baseline)
+cargo run --release -- --peers 3 --bad-peers 0 --duration-secs 5
+
+# Larger simulation
+cargo run --release -- --peers 6 --bad-peers 2 --duration-secs 12
 
 # Custom message rates
-cargo run --release -- --peers 6 --bad-peers 2 --duration-secs 15 --publish-per-sec 3 --spam-per-sec 8
+cargo run --release -- --peers 5 --bad-peers 2 --duration-secs 10 --publish-per-sec 3 --spam-per-sec 8
 
 # View all options
 cargo run -- --help
@@ -81,6 +87,9 @@ cargo run -- --help
 ```bash
 # Run property-based tests
 cargo test
+
+# Compile check
+cargo check
 
 # Run with debug logging
 RUST_LOG=debug cargo run -- --peers 3 --bad-peers 1 --duration-secs 5
