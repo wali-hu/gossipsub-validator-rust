@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Umbrella crate. We enable the features we use:
+# Umbrella crate. I enable the features I use:
 # - tokio + tcp + noise + yamux for transport
 # - gossipsub for pubsub
 # - macros for #[derive(NetworkBehaviour)]

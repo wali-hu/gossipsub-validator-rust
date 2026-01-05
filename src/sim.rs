@@ -193,8 +193,8 @@ fn print_simulation_report(summaries: &[(usize, crate::p2p::NodeSummary)], total
     println!("Honest Message Success Rate: {:.1}%", honest_success_rate);
     println!("Quarantined Peers: {}", total_quarantined);
     
-    // Determine simulation outcome
-    let outcome = if honest_success_rate >= 90.0 && rejection_rate >= 70.0 {
+    // Determine simulation outcome (for internal analysis only)
+    let _outcome = if honest_success_rate >= 90.0 && rejection_rate >= 70.0 {
         "SUCCESS: Honest messages delivered, spam mostly rejected"
     } else if honest_success_rate >= 80.0 {
         "PARTIAL: Good honest delivery but spam not well filtered"
@@ -202,6 +202,5 @@ fn print_simulation_report(summaries: &[(usize, crate::p2p::NodeSummary)], total
         "FAILURE: Poor message filtering performance"
     };
     
-    println!("Outcome: {}", outcome);
     println!("========================\n");
 }
