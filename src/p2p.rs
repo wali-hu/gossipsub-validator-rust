@@ -36,6 +36,8 @@ pub struct NodeSummary {
     pub ignored: u64,
     pub quarantined_peers: u64,
     pub avg_peer_score: f64,
+    pub honest_accepted: u64,    // New: track honest peer messages
+    pub honest_rejected: u64,    // New: track honest peer messages
 }
 
 #[derive(Clone)]
@@ -44,7 +46,7 @@ pub struct NodeHandle {
     pub cmd: mpsc::Sender<NodeCommand>,
 }
 
-pub fn spawn_node(cfg: NodeConfig) -> anyhow::Result<(NodeHandle, mpsc::Receiver<NodeEvent>)> {
+pub fn spawn_node(cfg: NodeConfig, bad_peer_ids: Vec<libp2p::PeerId>) -> anyhow::Result<(NodeHandle, mpsc::Receiver<NodeEvent>)> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<NodeCommand>(128);
     let (evt_tx, evt_rx) = mpsc::channel::<NodeEvent>(512);
 
@@ -52,7 +54,7 @@ pub fn spawn_node(cfg: NodeConfig) -> anyhow::Result<(NodeHandle, mpsc::Receiver
     let peer_id = *swarm.local_peer_id();
 
     tokio::spawn(async move {
-        if let Err(e) = run_node(cfg, swarm, cmd_rx, evt_tx).await {
+        if let Err(e) = run_node(cfg, swarm, cmd_rx, evt_tx, bad_peer_ids).await {
             warn!(?e, "node exited with error");
         }
     });
@@ -80,6 +82,7 @@ async fn run_node(
     mut swarm: Swarm<Behaviour>,
     mut cmd_rx: mpsc::Receiver<NodeCommand>,
     evt_tx: mpsc::Sender<NodeEvent>,
+    bad_peer_ids: Vec<libp2p::PeerId>,
 ) -> anyhow::Result<()> {
     let topic = gossipsub::IdentTopic::new(cfg.topic.clone());
 
@@ -90,6 +93,8 @@ async fn run_node(
     });
 
     let mut counters = Counters::default();
+    let mut honest_accepted = 0u64;
+    let mut honest_rejected = 0u64;
 
     info!(node = cfg.idx, peer=%swarm.local_peer_id(), "node started");
 
@@ -121,6 +126,8 @@ async fn run_node(
                             ignored: counters.ignored,
                             quarantined_peers: quarantined,
                             avg_peer_score: avg_score,
+                            honest_accepted,
+                            honest_rejected,
                         })).await;
                         break;
                     }
@@ -139,14 +146,21 @@ async fn run_node(
                         message,
                     })) => {
                         let decision = validator.validate(&propagation_source, &message.data);
+                        let is_honest_peer = !bad_peer_ids.contains(&propagation_source);
 
                         match decision.acceptance {
                             gossipsub::MessageAcceptance::Accept => {
                                 counters.accepted += 1;
+                                if is_honest_peer {
+                                    honest_accepted += 1;
+                                }
                                 debug!(node = cfg.idx, peer = %propagation_source, reason = decision.reason, "message accepted");
                             },
                             gossipsub::MessageAcceptance::Reject => {
                                 counters.rejected += 1;
+                                if is_honest_peer {
+                                    honest_rejected += 1;
+                                }
                                 debug!(node = cfg.idx, peer = %propagation_source, reason = decision.reason, "message rejected");
                             },
                             gossipsub::MessageAcceptance::Ignore => {

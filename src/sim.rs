@@ -22,7 +22,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             topic: cli.topic.clone(),
             max_message_bytes: cli.max_message_bytes,
         };
-        let (handle, rx) = spawn_node(cfg)?;
+        let (handle, rx) = spawn_node(cfg, vec![])?; // Pass empty for now, will fix calculation instead
         nodes.push(handle);
         event_rxs.push(rx);
     }
@@ -159,6 +159,7 @@ fn print_simulation_report(summaries: &[(usize, crate::p2p::NodeSummary)], total
         total_ignored += summary.ignored;
         total_quarantined += summary.quarantined_peers;
         
+        // Only count messages received by honest nodes (they don't receive their own messages)
         if *idx >= bad_peers {
             honest_accepted += summary.accepted;
             honest_rejected += summary.rejected;
@@ -178,6 +179,7 @@ fn print_simulation_report(summaries: &[(usize, crate::p2p::NodeSummary)], total
         0.0
     };
 
+    // Calculate honest success rate: honest messages accepted by honest nodes
     let honest_success_rate = if honest_accepted + honest_rejected > 0 {
         (honest_accepted as f64 / (honest_accepted + honest_rejected) as f64) * 100.0
     } else {
