@@ -1,33 +1,26 @@
 use clap::Parser;
 
-#[derive(Parser, Debug, Clone)]
-#[command(name = "gossipsub-score-sim", about = "Mini gossipsub validator + peer scoring simulation")]
+#[derive(Debug, Parser)]
+#[command(author, version, about, long_about = None)]
 pub struct Cli {
-    /// Total peers in the sim (includes bad peers).
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 10)]
     pub peers: usize,
 
-    /// First N peers are attackers/spammers.
     #[arg(long, default_value_t = 2)]
     pub bad_peers: usize,
 
     #[arg(long, default_value_t = 20)]
     pub duration_secs: u64,
 
-    /// Honest publish rate (per peer).
     #[arg(long, default_value_t = 5)]
-    pub publish_per_sec: u64,
+    pub publish_per_sec: u32,
 
-    /// Bad publish rate (per peer).
     #[arg(long, default_value_t = 50)]
-    pub spam_per_sec: u64,
+    pub spam_per_sec: u32,
 
-    #[arg(long, default_value = "frost-sim/coordination/1")]
-    pub topic: String,
-
-    #[arg(long, default_value_t = 1337)]
-    pub seed: u64,
-
-    #[arg(long, default_value_t = 16 * 1024)]
+    #[arg(long, default_value_t = 16384)]
     pub max_message_bytes: usize,
+
+    #[arg(long, default_value_t = 0)]
+    pub seed: u64,
 }

@@ -1,6 +1,6 @@
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
-use tokio::time::{Duration, interval};
+use rand::{Rng, SeedableRng};
+use tokio::time::{interval, Duration};
 use tracing::info;
 
 use crate::cli::Cli;
@@ -15,19 +15,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mut nodes = Vec::with_capacity(peers);
     let mut event_rxs = Vec::with_capacity(peers);
 
-    // Spawn all nodes
-    for idx in 0..peers {
+    for i in 0..peers {
         let cfg = NodeConfig {
-            idx,
-            topic: cli.topic.clone(),
+            idx: i,
+            topic: "test-topic".to_string(),
             max_message_bytes: cli.max_message_bytes,
         };
-        let (handle, rx) = spawn_node(cfg, vec![])?; // Pass empty for now, will fix calculation instead
+        let (handle, rx) = spawn_node(cfg, vec![])?; // dummy bad list here
         nodes.push(handle);
         event_rxs.push(rx);
     }
 
-    // Wait for each node to report a listen address.
+    // Wait for listen addresses.
     let mut listen_addrs = Vec::with_capacity(peers);
     for i in 0..peers {
         let rx = &mut event_rxs[i];
@@ -44,7 +43,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Dial everyone into node 0 as a bootstrap.
     let bootstrap = listen_addrs[0].clone();
     for i in 1..peers {
-        let _ = nodes[i].cmd.send(NodeCommand::Dial { addr: bootstrap.clone() }).await;
+        let _ = nodes[i]
+            .cmd
+            .send(NodeCommand::Dial {
+                addr: bootstrap.clone(),
+            })
+            .await;
     }
 
     // Subscribe everyone.
@@ -52,16 +56,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         let _ = n.cmd.send(NodeCommand::Subscribe).await;
     }
 
-    // Wait for connections to establish
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Start publishers.
+    // Spawn publisher tasks per node
     let mut pub_tasks = Vec::new();
     for (idx, n) in nodes.iter().enumerate() {
         let cmd = n.cmd.clone();
         let is_bad = idx < bad_peers;
         let mut rng = StdRng::seed_from_u64(cli.seed ^ (idx as u64));
-        let rate = if is_bad { cli.spam_per_sec } else { cli.publish_per_sec };
+        let rate = if is_bad {
+            cli.spam_per_sec
+        } else {
+            cli.publish_per_sec
+        };
         let max_bytes = cli.max_message_bytes;
 
         pub_tasks.push(tokio::spawn(async move {
@@ -80,34 +85,34 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             let mut junk = vec![0u8; rng.gen_range(1..=(max_bytes / 2))];
                             rng.fill(&mut junk[..]);
                             junk
-                        },
+                        }
                         1 => {
                             // Oversize payload
                             let payload_len = rng.gen_range(max_bytes..=(max_bytes * 2));
-                            encode(&WireMessage::Good { seq, payload: vec![0u8; payload_len] })
-                        },
+                            encode(&WireMessage::Good {
+                                seq,
+                                payload: vec![0u8; payload_len],
+                            })
+                        }
                         2 => {
-                            // Empty payload (should be rejected)
-                            encode(&WireMessage::Good { seq, payload: vec![] })
-                        },
+                            // Bad payload marker
+                            encode(&WireMessage::Bad)
+                        }
                         _ => {
-                            // Replay attack (old sequence number)
-                            let old_seq = seq.saturating_sub(rng.gen_range(1..=10));
-                            let payload_len = rng.gen_range(16..=128);
-                            let mut payload = vec![0u8; payload_len];
-                            rng.fill(&mut payload[..]);
-                            encode(&WireMessage::Good { seq: old_seq, payload })
+                            // Duplicate / repeated
+                            encode(&WireMessage::Good {
+                                seq: seq.saturating_sub(2),
+                                payload: vec![1u8; 10],
+                            })
                         }
                     }
                 } else {
-                    // Generate honest messages
-                    let payload_len = rng.gen_range(16..=128);
-                    let mut payload = vec![0u8; payload_len];
-                    rng.fill(&mut payload[..]);
-                    encode(&WireMessage::Good { seq, payload })
+                    encode(&WireMessage::Good {
+                        seq,
+                        payload: vec![1u8; 100],
+                    })
                 };
 
-                // Ignore errors if node is shutting down.
                 let _ = cmd.send(NodeCommand::Publish { data: bytes }).await;
             }
         }));
@@ -142,28 +147,30 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_simulation_report(summaries: &[(usize, crate::p2p::NodeSummary)], total_peers: usize, bad_peers: usize) {
+fn print_simulation_report(
+    summaries: &[(usize, crate::p2p::NodeSummary)],
+    total_peers: usize,
+    bad_peers: usize,
+) {
     let honest_peers = total_peers - bad_peers;
-    
+
     let mut total_accepted = 0;
     let mut total_rejected = 0;
     let mut total_ignored = 0;
     let mut total_quarantined = 0;
-    
+
     let mut honest_accepted = 0;
     let mut honest_rejected = 0;
-    
-    for (idx, summary) in summaries {
+
+    for (_idx, summary) in summaries {
         total_accepted += summary.accepted;
         total_rejected += summary.rejected;
         total_ignored += summary.ignored;
         total_quarantined += summary.quarantined_peers;
-        
-        // Only count messages received by honest nodes (they don't receive their own messages)
-        if *idx >= bad_peers {
-            honest_accepted += summary.accepted;
-            honest_rejected += summary.rejected;
-        }
+
+        // Use the honest counters collected per-node (these are tracked by author).
+        honest_accepted += summary.honest_accepted;
+        honest_rejected += summary.honest_rejected;
     }
 
     let total_messages = total_accepted + total_rejected + total_ignored;
@@ -172,7 +179,7 @@ fn print_simulation_report(summaries: &[(usize, crate::p2p::NodeSummary)], total
     } else {
         0.0
     };
-    
+
     let rejection_rate = if total_messages > 0 {
         (total_rejected as f64 / total_messages as f64) * 100.0
     } else {
@@ -187,15 +194,21 @@ fn print_simulation_report(summaries: &[(usize, crate::p2p::NodeSummary)], total
     };
 
     println!("\n=== SIMULATION SUMMARY ===");
-    println!("Total Peers: {} (Honest: {}, Bad: {})", total_peers, honest_peers, bad_peers);
+    println!(
+        "Total Peers: {} (Honest: {}, Bad: {})",
+        total_peers, honest_peers, bad_peers
+    );
     println!("Total Messages: {}", total_messages);
     println!("  - Accepted: {} ({:.1}%)", total_accepted, acceptance_rate);
     println!("  - Rejected: {} ({:.1}%)", total_rejected, rejection_rate);
-    println!("  - Ignored: {} ({:.1}%)", total_ignored, (total_ignored as f64 / total_messages as f64) * 100.0);
+    println!(
+        "  - Ignored: {} ({:.1}%)",
+        total_ignored,
+        (total_ignored as f64 / total_messages as f64) * 100.0
+    );
     println!("Honest Message Success Rate: {:.1}%", honest_success_rate);
     println!("Quarantined Peers: {}", total_quarantined);
-    
-    // Determine simulation outcome (for internal analysis only)
+
     let _outcome = if honest_success_rate >= 90.0 && rejection_rate >= 70.0 {
         "SUCCESS: Honest messages delivered, spam mostly rejected"
     } else if honest_success_rate >= 80.0 {
@@ -203,6 +216,6 @@ fn print_simulation_report(summaries: &[(usize, crate::p2p::NodeSummary)], total
     } else {
         "FAILURE: Poor message filtering performance"
     };
-    
+
     println!("========================\n");
 }

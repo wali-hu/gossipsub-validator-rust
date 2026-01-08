@@ -1,8 +1,8 @@
 use futures::StreamExt;
-use libp2p::{gossipsub, Multiaddr, Swarm, SwarmBuilder};
 use libp2p::swarm::SwarmEvent;
+use libp2p::{gossipsub, Multiaddr, Swarm, SwarmBuilder};
 use tokio::sync::mpsc;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 use crate::behaviour::{Behaviour, Event as BehaviourEvent};
 use crate::metrics::Counters;
@@ -36,8 +36,8 @@ pub struct NodeSummary {
     pub ignored: u64,
     pub quarantined_peers: u64,
     pub avg_peer_score: f64,
-    pub honest_accepted: u64,    // New: track honest peer messages
-    pub honest_rejected: u64,    // New: track honest peer messages
+    pub honest_accepted: u64,
+    pub honest_rejected: u64,
 }
 
 #[derive(Clone)]
@@ -46,7 +46,10 @@ pub struct NodeHandle {
     pub cmd: mpsc::Sender<NodeCommand>,
 }
 
-pub fn spawn_node(cfg: NodeConfig, bad_peer_ids: Vec<libp2p::PeerId>) -> anyhow::Result<(NodeHandle, mpsc::Receiver<NodeEvent>)> {
+pub fn spawn_node(
+    cfg: NodeConfig,
+    bad_peer_ids: Vec<libp2p::PeerId>,
+) -> anyhow::Result<(NodeHandle, mpsc::Receiver<NodeEvent>)> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<NodeCommand>(128);
     let (evt_tx, evt_rx) = mpsc::channel::<NodeEvent>(512);
 
@@ -59,20 +62,30 @@ pub fn spawn_node(cfg: NodeConfig, bad_peer_ids: Vec<libp2p::PeerId>) -> anyhow:
         }
     });
 
-    Ok((NodeHandle { peer_id, cmd: cmd_tx }, evt_rx))
+    Ok((
+        NodeHandle {
+            peer_id,
+            cmd: cmd_tx,
+        },
+        evt_rx,
+    ))
 }
 
 fn build_swarm(topic: &str) -> anyhow::Result<Swarm<Behaviour>> {
     // SwarmBuilder + TCP + Noise + Yamux (common baseline).
-    let swarm = SwarmBuilder::with_new_identity()
+    let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
             libp2p::tcp::Config::new(),
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
-        .with_behaviour(|key| Behaviour::new(key, topic))?
+        .with_behaviour(|key| Behaviour::new(key.clone(), topic))?
         .build();
+
+    // Listen on an ephemeral localhost TCP port so we receive NewListenAddr events.
+    let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse()?;
+    swarm.listen_on(listen_addr)?;
 
     Ok(swarm)
 }
@@ -84,14 +97,10 @@ async fn run_node(
     evt_tx: mpsc::Sender<NodeEvent>,
     bad_peer_ids: Vec<libp2p::PeerId>,
 ) -> anyhow::Result<()> {
-    let topic = gossipsub::IdentTopic::new(cfg.topic.clone());
-
-    swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse::<Multiaddr>()?)?;
-
+    let topic = cfg.topic.clone();
     let mut validator = Validator::new(ValidatorConfig {
         max_message_bytes: cfg.max_message_bytes,
     });
-
     let mut counters = Counters::default();
     let mut honest_accepted = 0u64;
     let mut honest_rejected = 0u64;
@@ -104,23 +113,25 @@ async fn run_node(
                 match cmd {
                     Some(NodeCommand::Dial { addr }) => {
                         swarm.dial(addr)?;
-                    }
+                    },
                     Some(NodeCommand::Subscribe) => {
-                        let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
-                    }
+                        let topic_hash = gossipsub::IdentTopic::new(&topic);
+                        let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic_hash)?;
+                    },
                     Some(NodeCommand::Publish { data }) => {
-                        let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data);
-                    }
+                        let topic_hash = gossipsub::IdentTopic::new(&topic);
+                        let _ = swarm.behaviour_mut().gossipsub.publish(topic_hash, data);
+                    },
                     Some(NodeCommand::Shutdown) | None => {
                         let quarantined = validator.get_quarantined_count() as u64;
                         let avg_score = if counters.accepted + counters.rejected > 0 {
-                            (counters.accepted as f64 * 0.1 - counters.rejected as f64 * 3.0) / 
+                            (counters.accepted as f64 * 0.1 - counters.rejected as f64 * 3.0) /
                             (counters.accepted + counters.rejected) as f64
                         } else {
                             0.0
                         };
 
-                        let _ = evt_tx.send(NodeEvent::Summary(NodeSummary {
+                        let summary = NodeSummary {
                             accepted: counters.accepted,
                             rejected: counters.rejected,
                             ignored: counters.ignored,
@@ -128,25 +139,29 @@ async fn run_node(
                             avg_peer_score: avg_score,
                             honest_accepted,
                             honest_rejected,
-                        })).await;
-                        break;
-                    }
-                }
-            }
+                        };
 
-            swarm_event = swarm.select_next_some() => {
-                match swarm_event {
+                        let _ = evt_tx.send(NodeEvent::Summary(summary)).await;
+                        break;
+                    },
+                }
+            },
+            event = swarm.select_next_some() => {
+                match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         let _ = evt_tx.send(NodeEvent::NewListenAddr(address)).await;
                     }
-
                     SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                         propagation_source,
                         message_id,
                         message,
                     })) => {
-                        let decision = validator.validate(&propagation_source, &message.data);
-                        let is_honest_peer = !bad_peer_ids.contains(&propagation_source);
+                        // Determine message author (publisher). If absent, fall back to propagation source.
+                        let author = message.source.clone().unwrap_or_else(|| propagation_source.clone());
+                        // Pass both author and forwarder to validator:
+                        let decision = validator.validate(&author, &propagation_source, &message.data);
+                        // Classify honesty by *author* (not by forwarder)
+                        let is_honest_peer = !bad_peer_ids.contains(&author);
 
                         match decision.acceptance {
                             gossipsub::MessageAcceptance::Accept => {
@@ -176,14 +191,14 @@ async fn run_node(
                             decision.acceptance
                         );
 
-                        // Apply application score
+                        // Apply application score for the forwarder (the node that delivered this message to us).
                         let new_score = validator.get_peer_score(&propagation_source);
-                        if new_score != 0.0 {
+                        if (new_score - 0.0).abs() > std::f64::EPSILON {
                             swarm.behaviour_mut().gossipsub.set_application_score(&propagation_source, new_score);
                         }
                     }
 
-                    _ => { /* ignore */ }
+                    _ => { /* ignore other events */ }
                 }
             }
         }

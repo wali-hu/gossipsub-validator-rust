@@ -1,20 +1,13 @@
-mod cli;
-mod sim;
-mod codec;
-mod validator;
-mod behaviour;
-mod p2p;
-mod metrics;
-
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter("info")
+        .with_span_events(FmtSpan::CLOSE)
         .init();
 
-    let cli = cli::Cli::parse();
-    sim::run(cli).await
+    let cli = gossipsub_score_sim::cli::Cli::parse();
+    gossipsub_score_sim::sim::run(cli).await
 }

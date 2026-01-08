@@ -1,14 +1,8 @@
-#[derive(Debug, Default, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct Counters {
     pub accepted: u64,
     pub rejected: u64,
     pub ignored: u64,
-    pub quarantined_peers: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PeerMetrics {
-    pub score: f64,
-    pub messages_sent: u64,
-    pub messages_rejected: u64,
 }
