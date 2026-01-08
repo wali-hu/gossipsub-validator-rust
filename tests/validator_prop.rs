@@ -62,9 +62,9 @@ fn bad_peer_quarantines_after_multiple_offences() {
     let bad = PeerId::random();
     
     // Simulate multiple offences that should trigger quarantine
-    v.record_offence_and_update(&bad, -80.0); // malicious_marker
+    v.record_offence_and_update(&bad, -80.0); // first offense
     assert!(!v.is_quarantined(&bad)); // Not yet quarantined
     
-    v.record_offence_and_update(&bad, -60.0); // oversize  
-    assert!(v.is_quarantined(&bad)); // Should be quarantined now (total: -80 + -90 = -170)
+    v.record_offence_and_update(&bad, -80.0); // second offense (scaled, total crosses -150)
+    assert!(v.is_quarantined(&bad)); // Should be quarantined now
 }
