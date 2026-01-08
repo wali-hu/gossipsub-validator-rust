@@ -4,7 +4,7 @@ const MAX_DEDUPE_SIZE: usize = 10_000;
 const TOKEN_BUCKET_CAPACITY: u32 = 100;
 const TOKEN_REFILL_RATE: f64 = 50.0; // tokens per second
 // Lower quarantine threshold so attackers are removed faster
-const QUARANTINE_THRESHOLD: f64 = -100.0;
+const QUARANTINE_THRESHOLD: f64 = -90.0;
 
 use std::collections::{HashMap, VecDeque, HashSet};
 use std::time::Instant;
@@ -149,7 +149,7 @@ impl Validator {
             Ok(m) => m,
             Err(_) => {
                 // decode failures -> blame author (malformed payload)
-                let base = -20.0;
+                let base = -30.0;
                 let target = author.unwrap_or(propagation_source);
                 self.record_offence_and_update(target, base);
                 return Decision {
@@ -235,6 +235,10 @@ impl Validator {
         self.app_scores.get(peer).copied()
     }
 
+    pub fn is_quarantined(&self, peer: &PeerId) -> bool {
+        self.peers.get(peer).map(|p| p.quarantined).unwrap_or(false)
+    }
+
     pub fn get_quarantined_count(&self) -> usize {
         self.peers.values().filter(|p| p.quarantined).count()
     }
@@ -258,10 +262,6 @@ impl Validator {
         if !was_quarantined && state.quarantined {
             tracing::warn!(peer = %peer, new_score = state.score, "peer entered quarantine");
         }
-    }
-
-    fn is_quarantined(&self, peer: &PeerId) -> bool {
-        self.peers.get(peer).map(|p| p.quarantined).unwrap_or(false)
     }
 
     fn get_peer_last_seq(&self, peer: &PeerId) -> Option<u64> {
@@ -300,7 +300,7 @@ impl Validator {
     }
 
     // increments offences count, computes scaled delta, updates score and returns the effective delta
-    fn record_offence_and_update(&mut self, peer: &PeerId, base_delta: f64) -> f64 {
+    pub fn record_offence_and_update(&mut self, peer: &PeerId, base_delta: f64) -> f64 {
         // increment offence count
         let count = self.offences.entry(*peer).or_insert(0);
         *count += 1;

@@ -28,7 +28,7 @@ proptest! {
     }
 
     #[test]
-    fn decode_errors_make_reject(seq in 1u64..1000u64) {
+    fn decode_errors_make_reject(_seq in 1u64..1000u64) {
         let mut v = Validator::new(ValidatorConfig { max_message_bytes: 16384 });
         let bytes = vec![0u8; 10]; // invalid bincode
         let decision = v.validate(&PeerId::random(), Some(&PeerId::random()), &bytes);
@@ -54,4 +54,17 @@ proptest! {
         prop_assert!(matches!(decision2.acceptance, libp2p::gossipsub::MessageAcceptance::Ignore));
         prop_assert_eq!(decision2.reason, "replay_or_old_seq");
     }
+}
+
+#[test]
+fn bad_peer_quarantines_after_multiple_offences() {
+    let mut v = Validator::new(ValidatorConfig { max_message_bytes: 16384 });
+    let bad = PeerId::random();
+    
+    // Simulate multiple offences that should trigger quarantine
+    v.record_offence_and_update(&bad, -80.0); // malicious_marker
+    assert!(!v.is_quarantined(&bad)); // Not yet quarantined
+    
+    v.record_offence_and_update(&bad, -60.0); // oversize  
+    assert!(v.is_quarantined(&bad)); // Should be quarantined now (total: -80 + -90 = -170)
 }

@@ -126,18 +126,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
                 let bytes = if is_bad {
                     // Generate various types of bad messages
-                    match rng.gen_range(0..4) {
+                    match rng.gen_range(0..8) {
                         0 => {
-                            // Pure junk (won't decode)
+                            // Pure junk (decode_error -20/-30)
                             let mut junk = vec![0u8; rng.gen_range(1..=(max_bytes / 2))];
                             rng.fill(&mut junk[..]);
                             junk
                         }
                         1 => {
-                            // Oversize payload - make it unique per node and seq
+                            // Oversize payload (-60)
                             let payload_len = rng.gen_range(max_bytes..=(max_bytes * 2));
                             let mut payload = vec![0u8; payload_len];
-                            // Fill with node-specific pattern to make unique
                             for (j, byte) in payload.iter_mut().enumerate() {
                                 *byte = ((i + j + seq as usize) % 256) as u8;
                             }
@@ -147,20 +146,52 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             })
                         }
                         2 => {
-                            // Bad payload marker - make unique by including seq and node
-                            let mut bad_data = format!("bad-{}-{}", i, seq).into_bytes();
-                            bad_data.extend_from_slice(&[0xFF; 10]); // Add some junk
-                            bad_data
+                            // Empty payload (-30)
+                            encode(&WireMessage::Good {
+                                seq,
+                                payload: vec![],
+                            })
                         }
-                        _ => {
-                            // Duplicate / repeated - make unique per node
-                            let mut payload = vec![1u8; 10];
-                            // Add node-specific bytes to make it unique
+                        3 => {
+                            // Malicious marker (-80)
+                            encode(&WireMessage::Bad)
+                        }
+                        4 => {
+                            // Replay attack (ignored/0) - use old seq
+                            let mut payload = vec![1u8; 50];
                             payload.extend_from_slice(&(i as u32).to_le_bytes());
                             encode(&WireMessage::Good {
-                                seq: seq.saturating_sub(2),
+                                seq: seq.saturating_sub(5),
                                 payload,
                             })
+                        }
+                        5 => {
+                            // Corrupt header (decode_error -20/-30)
+                            let mut corrupt = encode(&WireMessage::Good {
+                                seq,
+                                payload: vec![0xFF; 20],
+                            });
+                            // Corrupt first few bytes
+                            if corrupt.len() > 4 {
+                                corrupt[0] = 0xFF;
+                                corrupt[1] = 0xFE;
+                            }
+                            corrupt
+                        }
+                        6 => {
+                            // Duplicate attempt (decode_error -20/-30 or replay)
+                            let mut payload = vec![2u8; 30];
+                            payload.extend_from_slice(&(i as u32).to_le_bytes());
+                            encode(&WireMessage::Good {
+                                seq: seq.saturating_sub(1),
+                                payload,
+                            })
+                        }
+                        _ => {
+                            // Default junk
+                            let mut junk = vec![0u8; rng.gen_range(1..=20)];
+                            rng.fill(&mut junk[..]);
+                            junk
                         }
                     }
                 } else {
