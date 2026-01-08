@@ -123,6 +123,10 @@ async fn run_node(
                         let _ = swarm.behaviour_mut().gossipsub.publish(topic_hash, data);
                     },
                     Some(NodeCommand::Shutdown) | None => {
+                        for (peer, score, quarantined) in validator.dump_peer_states() {
+                            tracing::info!(node = cfg.idx, peer = %peer, score = score, quarantined = quarantined, "peer-state");
+                        }
+
                         let quarantined = validator.get_quarantined_count() as u64;
                         let avg_score = if counters.accepted + counters.rejected > 0 {
                             (counters.accepted as f64 * 0.1 - counters.rejected as f64 * 3.0) /

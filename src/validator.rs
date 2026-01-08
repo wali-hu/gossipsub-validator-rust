@@ -7,10 +7,12 @@ use std::time::Instant;
 use crate::codec::{decode, WireMessage};
 
 const MAX_PEERS: usize = 1000;
-const MAX_DEDUPE_SIZE: usize = 10000;
-const TOKEN_BUCKET_CAPACITY: u32 = 20;
-const TOKEN_REFILL_RATE: f64 = 15.0; // tokens per second
-const QUARANTINE_THRESHOLD: f64 = -100.0;
+const MAX_DEDUPE_SIZE: usize = 10_000;
+// Increased capacity + faster refill to tolerate honest bursts
+const TOKEN_BUCKET_CAPACITY: u32 = 100;
+const TOKEN_REFILL_RATE: f64 = 50.0; // tokens per second
+// Make quarantine threshold more conservative (harder to hit)
+const QUARANTINE_THRESHOLD: f64 = -200.0;
 
 #[derive(Debug, Clone)]
 pub struct ValidatorConfig {
@@ -96,6 +98,8 @@ impl Validator {
     /// Validate a message. `author` is the original message publisher (message.source),
     /// `forwarder` is the propagation source (the peer that forwarded the message to us).
     pub fn validate(&mut self, author: &PeerId, forwarder: &PeerId, bytes: &[u8]) -> Decision {
+        // Helpful debug: record incoming validation attempt
+        tracing::debug!(%author, %forwarder, len = bytes.len(), "validate called");
         // If forwarder quarantined, silently ignore
         if self.is_quarantined(forwarder) {
             return Decision {
@@ -107,23 +111,24 @@ impl Validator {
 
         // Oversize check
         if bytes.len() > self.cfg.max_message_bytes {
-            self.update_peer_score(forwarder, -50.0);
+            // smaller penalty to avoid immediate quarantine during bursts
+            self.update_peer_score(forwarder, -30.0);
             return Decision {
                 acceptance: MessageAcceptance::Reject,
                 reason: "oversize",
-                score_delta: -50.0,
+                score_delta: -30.0,
             };
         }
 
         // Rate limit check on forwarder
         self.ensure_peer_exists(forwarder);
         if !self.peers.get_mut(forwarder).unwrap().bucket.try_consume(1) {
-            // soft penalty for exceeding rate
-            self.update_peer_score(forwarder, -5.0);
+            // give a softer penalty for temporary bursts
+            self.update_peer_score(forwarder, -2.0);
             return Decision {
                 acceptance: MessageAcceptance::Reject,
                 reason: "rate_limited",
-                score_delta: -5.0,
+                score_delta: -2.0,
             };
         }
 
@@ -131,11 +136,12 @@ impl Validator {
         let msg = match decode(bytes) {
             Ok(m) => m,
             Err(_) => {
-                self.update_peer_score(forwarder, -20.0);
+                // decode errors likely indicate malicious payload forwarded by forwarder
+                self.update_peer_score(forwarder, -10.0);
                 return Decision {
                     acceptance: MessageAcceptance::Reject,
                     reason: "decode_error",
-                    score_delta: -20.0,
+                    score_delta: -10.0,
                 };
             }
         };
@@ -191,12 +197,12 @@ impl Validator {
                 };
             }
             WireMessage::Bad => {
-                // Clearly malicious / unparseable negative payload
-                self.update_peer_score(forwarder, -50.0);
+                // Clearly malicious payload — strong penalty but not immediate permanent quarantine
+                self.update_peer_score(forwarder, -40.0);
                 return Decision {
                     acceptance: MessageAcceptance::Reject,
                     reason: "malicious_payload",
-                    score_delta: -50.0,
+                    score_delta: -40.0,
                 };
             }
         }
@@ -210,11 +216,22 @@ impl Validator {
         self.peers.values().filter(|p| p.quarantined).count()
     }
 
+    pub fn dump_peer_states(&self) -> Vec<(libp2p::PeerId, f64, bool)> {
+        self.peers.iter().map(|(p,s)| (*p, s.score, s.quarantined)).collect()
+    }
+
     fn update_peer_score(&mut self, peer: &PeerId, delta: f64) {
         self.ensure_peer_exists(peer);
         let state = self.peers.get_mut(peer).unwrap();
         state.score += delta;
+        let was_quarantined = state.quarantined;
         state.quarantined = state.score <= QUARANTINE_THRESHOLD;
+
+        // Log score updates and transitions so we can debug why peers are quarantined
+        tracing::info!(peer = %peer, new_score = state.score, delta = delta, quarantined = state.quarantined, "peer score updated");
+        if !was_quarantined && state.quarantined {
+            tracing::warn!(peer = %peer, new_score = state.score, "peer entered quarantine");
+        }
     }
 
     fn is_quarantined(&self, peer: &PeerId) -> bool {
