@@ -1,18 +1,20 @@
+// --- constants / structs (replace existing constants) ---
+const MAX_DEDUPE_SIZE: usize = 10_000;
+// Keep generous token bucket capacity so honest bursts are fine
+const TOKEN_BUCKET_CAPACITY: u32 = 100;
+const TOKEN_REFILL_RATE: f64 = 50.0; // tokens per second
+// Lower quarantine threshold so attackers are removed faster
+const QUARANTINE_THRESHOLD: f64 = -120.0;
+
+use std::collections::{HashMap, VecDeque, HashSet};
+use std::time::Instant;
 use libp2p::gossipsub::MessageAcceptance;
 use libp2p::PeerId;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Instant;
 
 use crate::codec::{decode, WireMessage};
 
 const MAX_PEERS: usize = 1000;
-const MAX_DEDUPE_SIZE: usize = 10_000;
-// Increased capacity + faster refill to tolerate honest bursts
-const TOKEN_BUCKET_CAPACITY: u32 = 100;
-const TOKEN_REFILL_RATE: f64 = 50.0; // tokens per second
-// Make quarantine threshold more conservative (harder to hit)
-const QUARANTINE_THRESHOLD: f64 = -200.0;
 
 #[derive(Debug, Clone)]
 pub struct ValidatorConfig {
@@ -56,7 +58,7 @@ impl TokenBucket {
 struct PeerState {
     score: f64,
     bucket: TokenBucket,
-    last_seq: Option<u64>, // last seen sequence for the author
+    last_seq: Option<u64>,
     quarantined: bool,
 }
 
@@ -78,11 +80,15 @@ pub struct Decision {
     pub score_delta: f64,
 }
 
+// --- Validator struct now includes offences map ---
 pub struct Validator {
     cfg: ValidatorConfig,
     peers: HashMap<PeerId, PeerState>,
+    // small bounded dedupe
     dedupe_cache: VecDeque<[u8; 32]>,
     dedupe_set: HashSet<[u8; 32]>,
+    // offences counts per forwarder (escalate repeated malicious events)
+    offences: HashMap<PeerId, u32>,
 }
 
 impl Validator {
@@ -92,6 +98,7 @@ impl Validator {
             peers: HashMap::new(),
             dedupe_cache: VecDeque::new(),
             dedupe_set: HashSet::new(),
+            offences: HashMap::new(),
         }
     }
 
@@ -111,24 +118,26 @@ impl Validator {
 
         // Oversize check
         if bytes.len() > self.cfg.max_message_bytes {
-            // smaller penalty to avoid immediate quarantine during bursts
-            self.update_peer_score(forwarder, -30.0);
+            // stronger penalty for oversize
+            let base = -60.0;
+            self.record_offence_and_update(forwarder, base);
             return Decision {
                 acceptance: MessageAcceptance::Reject,
                 reason: "oversize",
-                score_delta: -30.0,
+                score_delta: base,
             };
         }
 
         // Rate limit check on forwarder
         self.ensure_peer_exists(forwarder);
         if !self.peers.get_mut(forwarder).unwrap().bucket.try_consume(1) {
-            // give a softer penalty for temporary bursts
-            self.update_peer_score(forwarder, -2.0);
+            // gentle penalty for short bursts; don't kill honest forwarders
+            let base = -5.0;
+            self.record_offence_and_update(forwarder, base);
             return Decision {
                 acceptance: MessageAcceptance::Reject,
                 reason: "rate_limited",
-                score_delta: -2.0,
+                score_delta: base,
             };
         }
 
@@ -136,12 +145,13 @@ impl Validator {
         let msg = match decode(bytes) {
             Ok(m) => m,
             Err(_) => {
-                // decode errors likely indicate malicious payload forwarded by forwarder
-                self.update_peer_score(forwarder, -10.0);
+                // decode failures may indicate malice from forwarder — medium penalty
+                let base = -20.0;
+                self.record_offence_and_update(forwarder, base);
                 return Decision {
                     acceptance: MessageAcceptance::Reject,
                     reason: "decode_error",
-                    score_delta: -10.0,
+                    score_delta: base,
                 };
             }
         };
@@ -168,18 +178,19 @@ impl Validator {
         match msg {
             WireMessage::Good { seq, payload } => {
                 if payload.is_empty() {
-                    self.update_peer_score(forwarder, -20.0);
+                    let base = -30.0;
+                    self.record_offence_and_update(forwarder, base);
                     return Decision {
                         acceptance: MessageAcceptance::Reject,
                         reason: "empty_payload",
-                        score_delta: -20.0,
+                        score_delta: base,
                     };
                 }
 
                 // Replay/sequence validation keyed by *author*
                 let last = self.get_peer_last_seq(author).unwrap_or(0);
                 if seq <= last {
-                    // Treat as IGNORE (do not punish forwarders); may be retransmit or out-of-order.
+                    // leave as IGNORE so forwarders are not punished for possible retransmits
                     return Decision {
                         acceptance: MessageAcceptance::Ignore,
                         reason: "replay_or_old_seq",
@@ -197,12 +208,13 @@ impl Validator {
                 };
             }
             WireMessage::Bad => {
-                // Clearly malicious payload — strong penalty but not immediate permanent quarantine
-                self.update_peer_score(forwarder, -40.0);
+                // clearly malicious payload — escalate heavily
+                let base = -80.0;
+                self.record_offence_and_update(forwarder, base);
                 return Decision {
                     acceptance: MessageAcceptance::Reject,
                     reason: "malicious_payload",
-                    score_delta: -40.0,
+                    score_delta: base,
                 };
             }
         }
@@ -271,5 +283,30 @@ impl Validator {
         }
         self.dedupe_cache.push_back(hash);
         self.dedupe_set.insert(hash);
+    }
+
+    // increments offences count, computes scaled delta, updates score and returns the effective delta
+    fn record_offence_and_update(&mut self, peer: &PeerId, base_delta: f64) -> f64 {
+        // increment offence count
+        let count = self.offences.entry(*peer).or_insert(0);
+        *count += 1;
+        let count_val = *count;
+        // scaling factor (each extra offence increases delta by 25%)
+        let scale = 1.0 + ((count_val as f64 - 1.0) * 0.25).max(0.0);
+        let effective_delta = base_delta * scale;
+        self.update_peer_score(peer, effective_delta);
+        tracing::info!(peer = %peer, offences = count_val, base = base_delta, effective = effective_delta, "offence recorded and score updated");
+        // if offences exceed 4, immediately quarantine
+        if count_val > 4 {
+            if let Some(s) = self.peers.get_mut(peer) {
+                s.quarantined = true;
+                tracing::warn!(peer = %peer, score = s.score, "peer forced into quarantine due to repeated offences");
+            }
+        }
+        effective_delta
+    }
+
+    fn get_offence_count(&self, peer: &PeerId) -> u32 {
+        *self.offences.get(peer).unwrap_or(&0)
     }
 }

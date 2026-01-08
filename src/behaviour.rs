@@ -48,7 +48,8 @@ impl Behaviour {
         use libp2p::gossipsub::{PeerScoreParams, PeerScoreThresholds};
         let mut params = PeerScoreParams::default();
         // Make application-specific weight non-zero so set_application_score matters.
-        params.app_specific_weight = 1.0;
+        // Make application-specific score (set_application_score) have stronger influence.
+        params.app_specific_weight = 5.0;
         // Disable aggressive IP-colocation penalties in localhost simulations.
         params.ip_colocation_factor_threshold = 1_000_000.0;
 
