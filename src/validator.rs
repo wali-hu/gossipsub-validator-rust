@@ -116,11 +116,10 @@ impl Validator {
             };
         }
 
-        // Oversize check
+        // Oversize check (blame the author for content size)
         if bytes.len() > self.cfg.max_message_bytes {
-            // stronger penalty for oversize
             let base = -60.0;
-            self.record_offence_and_update(forwarder, base);
+            self.record_offence_and_update(author, base); // <- author, not forwarder
             return Decision {
                 acceptance: MessageAcceptance::Reject,
                 reason: "oversize",
@@ -145,9 +144,9 @@ impl Validator {
         let msg = match decode(bytes) {
             Ok(m) => m,
             Err(_) => {
-                // decode failures may indicate malice from forwarder — medium penalty
+                // decode failures -> blame author (malformed payload)
                 let base = -20.0;
-                self.record_offence_and_update(forwarder, base);
+                self.record_offence_and_update(author, base); // <- author
                 return Decision {
                     acceptance: MessageAcceptance::Reject,
                     reason: "decode_error",
@@ -179,7 +178,7 @@ impl Validator {
             WireMessage::Good { seq, payload } => {
                 if payload.is_empty() {
                     let base = -30.0;
-                    self.record_offence_and_update(forwarder, base);
+                    self.record_offence_and_update(author, base); // <- author
                     return Decision {
                         acceptance: MessageAcceptance::Reject,
                         reason: "empty_payload",
@@ -208,9 +207,9 @@ impl Validator {
                 };
             }
             WireMessage::Bad => {
-                // clearly malicious payload — escalate heavily
+                // clearly malicious payload — blame author and escalate
                 let base = -80.0;
-                self.record_offence_and_update(forwarder, base);
+                self.record_offence_and_update(author, base); // <- author
                 return Decision {
                     acceptance: MessageAcceptance::Reject,
                     reason: "malicious_payload",
@@ -291,8 +290,8 @@ impl Validator {
         let count = self.offences.entry(*peer).or_insert(0);
         *count += 1;
         let count_val = *count;
-        // scaling factor (each extra offence increases delta by 25%)
-        let scale = 1.0 + ((count_val as f64 - 1.0) * 0.25).max(0.0);
+        // scaling factor (each extra offence increases delta by 50%)
+        let scale = 1.0 + ((count_val as f64 - 1.0) * 0.5).max(0.0);
         let effective_delta = base_delta * scale;
         self.update_peer_score(peer, effective_delta);
         tracing::info!(peer = %peer, offences = count_val, base = base_delta, effective = effective_delta, "offence recorded and score updated");
@@ -306,6 +305,7 @@ impl Validator {
         effective_delta
     }
 
+    #[allow(dead_code)]
     fn get_offence_count(&self, peer: &PeerId) -> u32 {
         *self.offences.get(peer).unwrap_or(&0)
     }

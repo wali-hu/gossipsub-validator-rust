@@ -61,7 +61,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     for (idx, n) in nodes.iter().enumerate() {
         let cmd = n.cmd.clone();
         let is_bad = idx < bad_peers;
-        let mut rng = StdRng::seed_from_u64(cli.seed ^ (idx as u64));
+        let mut rng = StdRng::seed_from_u64(cli.seed.wrapping_add(idx as u64));
         let rate = if is_bad {
             cli.spam_per_sec
         } else {
@@ -87,29 +87,45 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             junk
                         }
                         1 => {
-                            // Oversize payload
+                            // Oversize payload - make it unique per node and seq
                             let payload_len = rng.gen_range(max_bytes..=(max_bytes * 2));
+                            let mut payload = vec![0u8; payload_len];
+                            // Fill with node-specific pattern to make unique
+                            for (i, byte) in payload.iter_mut().enumerate() {
+                                *byte = ((idx + i + seq as usize) % 256) as u8;
+                            }
                             encode(&WireMessage::Good {
                                 seq,
-                                payload: vec![0u8; payload_len],
+                                payload,
                             })
                         }
                         2 => {
-                            // Bad payload marker
-                            encode(&WireMessage::Bad)
+                            // Bad payload marker - make unique by including seq and node
+                            let mut bad_data = format!("bad-{}-{}", idx, seq).into_bytes();
+                            bad_data.extend_from_slice(&[0xFF; 10]); // Add some junk
+                            bad_data
                         }
                         _ => {
-                            // Duplicate / repeated
+                            // Duplicate / repeated - make unique per node
+                            let mut payload = vec![1u8; 10];
+                            // Add node-specific bytes to make it unique
+                            payload.extend_from_slice(&(idx as u32).to_le_bytes());
                             encode(&WireMessage::Good {
                                 seq: seq.saturating_sub(2),
-                                payload: vec![1u8; 10],
+                                payload,
                             })
                         }
                     }
                 } else {
+                    // Honest nodes: use node index and seq to create unique payloads
+                    let mut payload = vec![0u8; 100];
+                    // Fill with node-specific pattern
+                    for (i, byte) in payload.iter_mut().enumerate() {
+                        *byte = ((idx + i + seq as usize) % 256) as u8;
+                    }
                     encode(&WireMessage::Good {
                         seq,
-                        payload: vec![1u8; 100],
+                        payload,
                     })
                 };
 
