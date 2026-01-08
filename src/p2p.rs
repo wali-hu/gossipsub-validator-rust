@@ -50,6 +50,7 @@ pub struct NodeHandle {
 pub fn spawn_node(
     cfg: NodeConfig,
     bad_peer_ids: Vec<libp2p::PeerId>,
+    ready_tx: Option<mpsc::UnboundedSender<usize>>,
 ) -> anyhow::Result<(NodeHandle, mpsc::Receiver<NodeEvent>)> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<NodeCommand>(128);
     let (evt_tx, evt_rx) = mpsc::channel::<NodeEvent>(512);
@@ -58,7 +59,7 @@ pub fn spawn_node(
     let peer_id = *swarm.local_peer_id();
 
     tokio::spawn(async move {
-        if let Err(e) = run_node(cfg, swarm, cmd_rx, evt_tx, bad_peer_ids).await {
+        if let Err(e) = run_node(cfg, swarm, cmd_rx, evt_tx, bad_peer_ids, ready_tx).await {
             warn!(?e, "node exited with error");
         }
     });
@@ -97,6 +98,7 @@ async fn run_node(
     mut cmd_rx: mpsc::Receiver<NodeCommand>,
     evt_tx: mpsc::Sender<NodeEvent>,
     mut bad_peer_ids: Vec<libp2p::PeerId>,
+    ready_tx: Option<mpsc::UnboundedSender<usize>>,
 ) -> anyhow::Result<()> {
     let topic = cfg.topic.clone();
     let mut validator = Validator::new(ValidatorConfig {
@@ -118,6 +120,11 @@ async fn run_node(
                     Some(NodeCommand::Subscribe) => {
                         let topic_hash = gossipsub::IdentTopic::new(&topic);
                         let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic_hash)?;
+                        
+                        // Signal ready after subscription
+                        if let Some(tx) = &ready_tx {
+                            let _ = tx.send(cfg.idx);
+                        }
                     },
                     Some(NodeCommand::Publish { data }) => {
                         let topic_hash = gossipsub::IdentTopic::new(&topic);

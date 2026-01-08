@@ -1,6 +1,7 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::time::{interval, Duration};
+use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::cli::Cli;
@@ -15,6 +16,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mut nodes: Vec<NodeHandle> = Vec::with_capacity(peers);
     let mut event_rxs = Vec::with_capacity(peers);
 
+    // Create ready barrier
+    let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<usize>();
+
     // First pass: spawn all nodes to get their peer IDs
     let mut temp_handles = Vec::with_capacity(peers);
     for i in 0..peers {
@@ -23,7 +27,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             topic: "test-topic".to_string(),
             max_message_bytes: cli.max_message_bytes,
         };
-        let (handle, rx) = spawn_node(cfg, vec![])?; // empty bad list for now
+        let (handle, rx) = spawn_node(cfg, vec![], Some(ready_tx.clone()))?;
         temp_handles.push(handle);
         event_rxs.push(rx);
     }
@@ -37,19 +41,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     info!(?bad_peer_ids, "identified bad peers");
 
-    // Send bad peer list to all nodes
-    for (i, n) in nodes.iter().enumerate() {
-        let _ = n.cmd.send(NodeCommand::SetBadPeers { 
-            bad_peer_ids: bad_peer_ids.clone() 
-        }).await;
-        info!(node = i, "sent bad peer list to node");
-    }
-
-    // Give nodes time to process the bad peer list
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Second pass: restart nodes with proper bad peer list
-    // For now, let's use the temp_handles as our nodes since we can't easily restart them
     nodes = temp_handles;
 
     // Wait for listen addresses.
@@ -80,6 +71,35 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Subscribe everyone.
     for n in &nodes {
         let _ = n.cmd.send(NodeCommand::Subscribe).await;
+    }
+
+    // Give time for gossipsub mesh to form
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Wait until all nodes report ready (with timeout)
+    let mut ready_count = 0usize;
+    let expected = peers;
+    let timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
+
+    while ready_count < expected {
+        tokio::select! {
+            Some(_idx) = ready_rx.recv() => { ready_count += 1; }
+            () = &mut timeout => {
+                eprintln!("WARN: ready barrier timeout: got {}/{} ready", ready_count, expected);
+                break;
+            }
+        }
+    }
+
+    info!(ready_count, expected, "nodes ready, sending bad peer list");
+
+    // Now safe to broadcast SetBadPeers to nodes
+    for (i, n) in nodes.iter().enumerate() {
+        let _ = n.cmd.send(NodeCommand::SetBadPeers { 
+            bad_peer_ids: bad_peer_ids.clone() 
+        }).await;
+        info!(node = i, "sent bad peer list to node");
     }
 
     // Spawn publisher tasks per node

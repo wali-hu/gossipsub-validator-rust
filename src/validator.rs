@@ -4,7 +4,7 @@ const MAX_DEDUPE_SIZE: usize = 10_000;
 const TOKEN_BUCKET_CAPACITY: u32 = 100;
 const TOKEN_REFILL_RATE: f64 = 50.0; // tokens per second
 // Lower quarantine threshold so attackers are removed faster
-const QUARANTINE_THRESHOLD: f64 = -120.0;
+const QUARANTINE_THRESHOLD: f64 = -100.0;
 
 use std::collections::{HashMap, VecDeque, HashSet};
 use std::time::Instant;
