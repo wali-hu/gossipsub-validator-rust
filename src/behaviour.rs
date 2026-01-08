@@ -2,6 +2,7 @@ use libp2p::gossipsub;
 use libp2p::identity::Keypair;
 use libp2p::swarm::NetworkBehaviour;
 use sha2::{Digest, Sha256};
+use hex;
 
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "Event")]

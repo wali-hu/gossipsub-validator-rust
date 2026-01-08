@@ -20,6 +20,7 @@ pub enum NodeCommand {
     Dial { addr: Multiaddr },
     Subscribe,
     Publish { data: Vec<u8> },
+    SetBadPeers { bad_peer_ids: Vec<libp2p::PeerId> },
     Shutdown,
 }
 
@@ -95,7 +96,7 @@ async fn run_node(
     mut swarm: Swarm<Behaviour>,
     mut cmd_rx: mpsc::Receiver<NodeCommand>,
     evt_tx: mpsc::Sender<NodeEvent>,
-    bad_peer_ids: Vec<libp2p::PeerId>,
+    mut bad_peer_ids: Vec<libp2p::PeerId>,
 ) -> anyhow::Result<()> {
     let topic = cfg.topic.clone();
     let mut validator = Validator::new(ValidatorConfig {
@@ -121,6 +122,10 @@ async fn run_node(
                     Some(NodeCommand::Publish { data }) => {
                         let topic_hash = gossipsub::IdentTopic::new(&topic);
                         let _ = swarm.behaviour_mut().gossipsub.publish(topic_hash, data);
+                    },
+                    Some(NodeCommand::SetBadPeers { bad_peer_ids: new_bad_peers }) => {
+                        bad_peer_ids = new_bad_peers;
+                        info!(node = cfg.idx, ?bad_peer_ids, "updated bad peer list");
                     },
                     Some(NodeCommand::Shutdown) | None => {
                         for (peer, score, quarantined) in validator.dump_peer_states() {
@@ -160,10 +165,11 @@ async fn run_node(
                         message_id,
                         message,
                     })) => {
+                        let author_opt: Option<&libp2p::PeerId> = message.source.as_ref();
+                        let decision = validator.validate(&propagation_source, author_opt, &message.data);
+                        
                         // Determine message author (publisher). If absent, fall back to propagation source.
                         let author = message.source.clone().unwrap_or_else(|| propagation_source.clone());
-                        // Pass both author and forwarder to validator:
-                        let decision = validator.validate(&author, &propagation_source, &message.data);
                         // Classify honesty by *author* (not by forwarder)
                         let is_honest_peer = !bad_peer_ids.contains(&author);
 
@@ -188,17 +194,18 @@ async fn run_node(
                             },
                         }
 
-                        // Manual validation: MUST report exactly one result per message.
+                        // report to gossipsub (important)
                         swarm.behaviour_mut().gossipsub.report_message_validation_result(
                             &message_id,
                             &propagation_source,
-                            decision.acceptance
+                            decision.acceptance,
                         );
 
-                        // Apply application score for the forwarder (the node that delivered this message to us).
-                        let new_score = validator.get_peer_score(&propagation_source);
-                        if (new_score - 0.0).abs() > std::f64::EPSILON {
-                            swarm.behaviour_mut().gossipsub.set_application_score(&propagation_source, new_score);
+                        // update libp2p app score from validator (if validator exposes get_app_score)
+                        if let Some(new_score) = validator.get_app_score_option(author_opt.unwrap_or(&propagation_source)) {
+                            // set_application_score expects owned PeerId
+                            let target = author_opt.cloned().unwrap_or_else(|| propagation_source.clone());
+                            swarm.behaviour_mut().gossipsub.set_application_score(&target, new_score);
                         }
                     }
 

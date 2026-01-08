@@ -5,26 +5,52 @@ use tracing::info;
 
 use crate::cli::Cli;
 use crate::codec::{encode, WireMessage};
-use crate::p2p::{spawn_node, NodeCommand, NodeConfig, NodeEvent};
+use crate::p2p::{spawn_node, NodeCommand, NodeConfig, NodeEvent, NodeHandle};
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let peers = cli.peers.max(1);
     let bad_peers = cli.bad_peers.min(peers);
     let duration = Duration::from_secs(cli.duration_secs);
 
-    let mut nodes = Vec::with_capacity(peers);
+    let mut nodes: Vec<NodeHandle> = Vec::with_capacity(peers);
     let mut event_rxs = Vec::with_capacity(peers);
 
+    // First pass: spawn all nodes to get their peer IDs
+    let mut temp_handles = Vec::with_capacity(peers);
     for i in 0..peers {
         let cfg = NodeConfig {
             idx: i,
             topic: "test-topic".to_string(),
             max_message_bytes: cli.max_message_bytes,
         };
-        let (handle, rx) = spawn_node(cfg, vec![])?; // dummy bad list here
-        nodes.push(handle);
+        let (handle, rx) = spawn_node(cfg, vec![])?; // empty bad list for now
+        temp_handles.push(handle);
         event_rxs.push(rx);
     }
+
+    // Collect bad peer IDs (first bad_peers nodes are malicious)
+    let bad_peer_ids: Vec<libp2p::PeerId> = temp_handles
+        .iter()
+        .take(bad_peers)
+        .map(|h| h.peer_id)
+        .collect();
+
+    info!(?bad_peer_ids, "identified bad peers");
+
+    // Send bad peer list to all nodes
+    for (i, n) in nodes.iter().enumerate() {
+        let _ = n.cmd.send(NodeCommand::SetBadPeers { 
+            bad_peer_ids: bad_peer_ids.clone() 
+        }).await;
+        info!(node = i, "sent bad peer list to node");
+    }
+
+    // Give nodes time to process the bad peer list
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Second pass: restart nodes with proper bad peer list
+    // For now, let's use the temp_handles as our nodes since we can't easily restart them
+    nodes = temp_handles;
 
     // Wait for listen addresses.
     let mut listen_addrs = Vec::with_capacity(peers);
@@ -58,10 +84,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // Spawn publisher tasks per node
     let mut pub_tasks = Vec::new();
-    for (idx, n) in nodes.iter().enumerate() {
+    for (i, n) in nodes.iter().enumerate() {
         let cmd = n.cmd.clone();
-        let is_bad = idx < bad_peers;
-        let mut rng = StdRng::seed_from_u64(cli.seed.wrapping_add(idx as u64));
+        let is_bad = i < bad_peers;
+        let node_seed = cli.seed.wrapping_add(i as u64);
+        let mut rng = StdRng::seed_from_u64(node_seed);
         let rate = if is_bad {
             cli.spam_per_sec
         } else {
@@ -91,8 +118,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             let payload_len = rng.gen_range(max_bytes..=(max_bytes * 2));
                             let mut payload = vec![0u8; payload_len];
                             // Fill with node-specific pattern to make unique
-                            for (i, byte) in payload.iter_mut().enumerate() {
-                                *byte = ((idx + i + seq as usize) % 256) as u8;
+                            for (j, byte) in payload.iter_mut().enumerate() {
+                                *byte = ((i + j + seq as usize) % 256) as u8;
                             }
                             encode(&WireMessage::Good {
                                 seq,
@@ -101,7 +128,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         }
                         2 => {
                             // Bad payload marker - make unique by including seq and node
-                            let mut bad_data = format!("bad-{}-{}", idx, seq).into_bytes();
+                            let mut bad_data = format!("bad-{}-{}", i, seq).into_bytes();
                             bad_data.extend_from_slice(&[0xFF; 10]); // Add some junk
                             bad_data
                         }
@@ -109,7 +136,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                             // Duplicate / repeated - make unique per node
                             let mut payload = vec![1u8; 10];
                             // Add node-specific bytes to make it unique
-                            payload.extend_from_slice(&(idx as u32).to_le_bytes());
+                            payload.extend_from_slice(&(i as u32).to_le_bytes());
                             encode(&WireMessage::Good {
                                 seq: seq.saturating_sub(2),
                                 payload,
@@ -120,8 +147,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     // Honest nodes: use node index and seq to create unique payloads
                     let mut payload = vec![0u8; 100];
                     // Fill with node-specific pattern
-                    for (i, byte) in payload.iter_mut().enumerate() {
-                        *byte = ((idx + i + seq as usize) % 256) as u8;
+                    for (j, byte) in payload.iter_mut().enumerate() {
+                        *byte = ((i + j + seq as usize) % 256) as u8;
                     }
                     encode(&WireMessage::Good {
                         seq,

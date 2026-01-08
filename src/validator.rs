@@ -89,6 +89,8 @@ pub struct Validator {
     dedupe_set: HashSet<[u8; 32]>,
     // offences counts per forwarder (escalate repeated malicious events)
     offences: HashMap<PeerId, u32>,
+    // app scores for libp2p integration
+    app_scores: HashMap<PeerId, f64>,
 }
 
 impl Validator {
@@ -99,16 +101,17 @@ impl Validator {
             dedupe_cache: VecDeque::new(),
             dedupe_set: HashSet::new(),
             offences: HashMap::new(),
+            app_scores: HashMap::new(),
         }
     }
 
     /// Validate a message. `author` is the original message publisher (message.source),
-    /// `forwarder` is the propagation source (the peer that forwarded the message to us).
-    pub fn validate(&mut self, author: &PeerId, forwarder: &PeerId, bytes: &[u8]) -> Decision {
+    /// `propagation_source` is the peer that forwarded the message to us.
+    pub fn validate(&mut self, propagation_source: &PeerId, author: Option<&PeerId>, bytes: &[u8]) -> Decision {
         // Helpful debug: record incoming validation attempt
-        tracing::debug!(%author, %forwarder, len = bytes.len(), "validate called");
+        tracing::debug!(?author, %propagation_source, len = bytes.len(), "validate called");
         // If forwarder quarantined, silently ignore
-        if self.is_quarantined(forwarder) {
+        if self.is_quarantined(propagation_source) {
             return Decision {
                 acceptance: MessageAcceptance::Ignore,
                 reason: "forwarder_quarantined",
@@ -119,7 +122,8 @@ impl Validator {
         // Oversize check (blame the author for content size)
         if bytes.len() > self.cfg.max_message_bytes {
             let base = -60.0;
-            self.record_offence_and_update(author, base); // <- author, not forwarder
+            let target = author.unwrap_or(propagation_source);
+            self.record_offence_and_update(target, base);
             return Decision {
                 acceptance: MessageAcceptance::Reject,
                 reason: "oversize",
@@ -128,11 +132,11 @@ impl Validator {
         }
 
         // Rate limit check on forwarder
-        self.ensure_peer_exists(forwarder);
-        if !self.peers.get_mut(forwarder).unwrap().bucket.try_consume(1) {
+        self.ensure_peer_exists(propagation_source);
+        if !self.peers.get_mut(propagation_source).unwrap().bucket.try_consume(1) {
             // gentle penalty for short bursts; don't kill honest forwarders
             let base = -5.0;
-            self.record_offence_and_update(forwarder, base);
+            self.record_offence_and_update(propagation_source, base);
             return Decision {
                 acceptance: MessageAcceptance::Reject,
                 reason: "rate_limited",
@@ -146,7 +150,8 @@ impl Validator {
             Err(_) => {
                 // decode failures -> blame author (malformed payload)
                 let base = -20.0;
-                self.record_offence_and_update(author, base); // <- author
+                let target = author.unwrap_or(propagation_source);
+                self.record_offence_and_update(target, base);
                 return Decision {
                     acceptance: MessageAcceptance::Reject,
                     reason: "decode_error",
@@ -178,7 +183,8 @@ impl Validator {
             WireMessage::Good { seq, payload } => {
                 if payload.is_empty() {
                     let base = -30.0;
-                    self.record_offence_and_update(author, base); // <- author
+                    let target = author.unwrap_or(propagation_source);
+                    self.record_offence_and_update(target, base);
                     return Decision {
                         acceptance: MessageAcceptance::Reject,
                         reason: "empty_payload",
@@ -187,7 +193,8 @@ impl Validator {
                 }
 
                 // Replay/sequence validation keyed by *author*
-                let last = self.get_peer_last_seq(author).unwrap_or(0);
+                let target = author.unwrap_or(propagation_source);
+                let last = self.get_peer_last_seq(target).unwrap_or(0);
                 if seq <= last {
                     // leave as IGNORE so forwarders are not punished for possible retransmits
                     return Decision {
@@ -197,7 +204,7 @@ impl Validator {
                     };
                 }
                 // Update last seq for author
-                self.update_peer_last_seq(author, seq);
+                self.update_peer_last_seq(target, seq);
 
                 // Accept valid message
                 return Decision {
@@ -209,7 +216,8 @@ impl Validator {
             WireMessage::Bad => {
                 // clearly malicious payload — blame author and escalate
                 let base = -80.0;
-                self.record_offence_and_update(author, base); // <- author
+                let target = author.unwrap_or(propagation_source);
+                self.record_offence_and_update(target, base);
                 return Decision {
                     acceptance: MessageAcceptance::Reject,
                     reason: "malicious_payload",
@@ -221,6 +229,10 @@ impl Validator {
 
     pub fn get_peer_score(&self, peer: &PeerId) -> f64 {
         self.peers.get(peer).map(|p| p.score).unwrap_or(0.0)
+    }
+
+    pub fn get_app_score_option(&self, peer: &PeerId) -> Option<f64> {
+        self.app_scores.get(peer).copied()
     }
 
     pub fn get_quarantined_count(&self) -> usize {
@@ -237,6 +249,9 @@ impl Validator {
         state.score += delta;
         let was_quarantined = state.quarantined;
         state.quarantined = state.score <= QUARANTINE_THRESHOLD;
+
+        // Update app score for libp2p integration
+        self.app_scores.insert(*peer, state.score);
 
         // Log score updates and transitions so we can debug why peers are quarantined
         tracing::info!(peer = %peer, new_score = state.score, delta = delta, quarantined = state.quarantined, "peer score updated");
