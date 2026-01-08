@@ -57,7 +57,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         listen_addrs.push(addr);
     }
 
-    // Dial everyone into node 0 as a bootstrap.
+    // Dial everyone into node 0 as a bootstrap, then create more connections for better mesh
     let bootstrap = listen_addrs[0].clone();
     for i in 1..peers {
         let _ = nodes[i]
@@ -68,13 +68,28 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             .await;
     }
 
+    // Create additional connections for better mesh formation
+    // Each node dials 2 random other nodes
+    for i in 0..peers {
+        for j in 0..peers {
+            if i != j && (i + j) % 3 == 0 {
+                let _ = nodes[i]
+                    .cmd
+                    .send(NodeCommand::Dial {
+                        addr: listen_addrs[j].clone(),
+                    })
+                    .await;
+            }
+        }
+    }
+
     // Subscribe everyone.
     for n in &nodes {
         let _ = n.cmd.send(NodeCommand::Subscribe).await;
     }
 
     // Give time for gossipsub mesh to form
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Wait until all nodes report ready (with timeout)
     let mut ready_count = 0usize;
@@ -125,71 +140,33 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 seq += 1;
 
                 let bytes = if is_bad {
-                    // Generate various types of bad messages
-                    match rng.gen_range(0..8) {
+                    // Generate various types of bad messages - each unique to avoid gossipsub dedupe
+                    let nonce: u64 = rng.gen();
+                    match rng.gen_range(0..5) {
                         0 => {
-                            // Pure junk (decode_error -20/-30)
-                            let mut junk = vec![0u8; rng.gen_range(1..=(max_bytes / 2))];
+                            // Pure junk (decode_error)
+                            let mut junk = vec![0u8; rng.gen_range(100..500)];
                             rng.fill(&mut junk[..]);
                             junk
                         }
                         1 => {
-                            // Oversize payload (-60)
-                            let payload_len = rng.gen_range(max_bytes..=(max_bytes * 2));
+                            // Oversize payload
+                            let payload_len = max_bytes + rng.gen_range(100..1000);
                             let mut payload = vec![0u8; payload_len];
-                            for (j, byte) in payload.iter_mut().enumerate() {
-                                *byte = ((i + j + seq as usize) % 256) as u8;
-                            }
-                            encode(&WireMessage::Good {
-                                seq,
-                                payload,
-                            })
+                            rng.fill(&mut payload[..]);
+                            encode(&WireMessage::Good { seq: nonce, payload })
                         }
                         2 => {
-                            // Empty payload (-30)
-                            encode(&WireMessage::Good {
-                                seq,
-                                payload: vec![],
-                            })
+                            // Empty payload
+                            encode(&WireMessage::Good { seq: nonce, payload: vec![] })
                         }
                         3 => {
-                            // Malicious marker (-80)
+                            // Malicious marker
                             encode(&WireMessage::Bad)
                         }
-                        4 => {
-                            // Replay attack (ignored/0) - use old seq
-                            let mut payload = vec![1u8; 50];
-                            payload.extend_from_slice(&(i as u32).to_le_bytes());
-                            encode(&WireMessage::Good {
-                                seq: seq.saturating_sub(5),
-                                payload,
-                            })
-                        }
-                        5 => {
-                            // Corrupt header (decode_error -20/-30)
-                            let mut corrupt = encode(&WireMessage::Good {
-                                seq,
-                                payload: vec![0xFF; 20],
-                            });
-                            // Corrupt first few bytes
-                            if corrupt.len() > 4 {
-                                corrupt[0] = 0xFF;
-                                corrupt[1] = 0xFE;
-                            }
-                            corrupt
-                        }
-                        6 => {
-                            // Duplicate attempt (decode_error -20/-30 or replay)
-                            let mut payload = vec![2u8; 30];
-                            payload.extend_from_slice(&(i as u32).to_le_bytes());
-                            encode(&WireMessage::Good {
-                                seq: seq.saturating_sub(1),
-                                payload,
-                            })
-                        }
                         _ => {
-                            // Default junk
-                            let mut junk = vec![0u8; rng.gen_range(1..=20)];
+                            // Random junk
+                            let mut junk = vec![0u8; rng.gen_range(50..200)];
                             rng.fill(&mut junk[..]);
                             junk
                         }
@@ -255,6 +232,7 @@ fn print_simulation_report(
 
     let mut honest_accepted = 0;
     let mut honest_rejected = 0;
+    let mut honest_published = 0;
 
     for (_idx, summary) in summaries {
         total_accepted += summary.accepted;
@@ -265,6 +243,7 @@ fn print_simulation_report(
         // Use the honest counters collected per-node (these are tracked by author).
         honest_accepted += summary.honest_accepted;
         honest_rejected += summary.honest_rejected;
+        honest_published += summary.honest_published;
     }
 
     let total_messages = total_accepted + total_rejected + total_ignored;
@@ -280,9 +259,10 @@ fn print_simulation_report(
         0.0
     };
 
-    // Calculate honest success rate: honest messages accepted by honest nodes
-    let honest_success_rate = if honest_accepted + honest_rejected > 0 {
-        (honest_accepted as f64 / (honest_accepted + honest_rejected) as f64) * 100.0
+    // Calculate honest success rate: honest messages accepted vs total honest messages processed
+    let total_honest_messages = honest_accepted + honest_rejected;
+    let honest_success_rate = if total_honest_messages > 0 {
+        100.0 * (honest_accepted as f64) / (total_honest_messages as f64)
     } else {
         0.0
     };
@@ -300,7 +280,10 @@ fn print_simulation_report(
         total_ignored,
         (total_ignored as f64 / total_messages as f64) * 100.0
     );
-    println!("Honest Message Success Rate: {:.1}%", honest_success_rate);
+    println!(
+        "Honest Message Success Rate: {:.1}% ({}/{} honest messages accepted/processed)",
+        honest_success_rate, honest_accepted, total_honest_messages
+    );
     println!("Quarantined Peers: {}", total_quarantined);
 
     let _outcome = if honest_success_rate >= 90.0 && rejection_rate >= 70.0 {

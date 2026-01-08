@@ -39,6 +39,7 @@ pub struct NodeSummary {
     pub avg_peer_score: f64,
     pub honest_accepted: u64,
     pub honest_rejected: u64,
+    pub honest_published: u64,
 }
 
 #[derive(Clone)]
@@ -107,6 +108,7 @@ async fn run_node(
     let mut counters = Counters::default();
     let mut honest_accepted = 0u64;
     let mut honest_rejected = 0u64;
+    let mut honest_published = 0u64;
 
     info!(node = cfg.idx, peer=%swarm.local_peer_id(), "node started");
 
@@ -128,6 +130,12 @@ async fn run_node(
                     },
                     Some(NodeCommand::Publish { data }) => {
                         let topic_hash = gossipsub::IdentTopic::new(&topic);
+                        
+                        // Count honest published messages
+                        let local_peer = *swarm.local_peer_id();
+                        if !bad_peer_ids.contains(&local_peer) {
+                            honest_published += 1;
+                        }
                         let _ = swarm.behaviour_mut().gossipsub.publish(topic_hash, data);
                     },
                     Some(NodeCommand::SetBadPeers { bad_peer_ids: new_bad_peers }) => {
@@ -155,6 +163,7 @@ async fn run_node(
                             avg_peer_score: avg_score,
                             honest_accepted,
                             honest_rejected,
+                            honest_published,
                         };
 
                         let _ = evt_tx.send(NodeEvent::Summary(summary)).await;
